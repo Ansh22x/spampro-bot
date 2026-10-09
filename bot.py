@@ -1626,6 +1626,10 @@ def main() -> None:
         for name, delay in config.SPAM_MODES.items()
     )
     log.info("Repeat Bot is running (max=%s, modes=%s)", config.MAX_REPEAT, modes)
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
