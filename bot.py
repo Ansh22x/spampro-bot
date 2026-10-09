@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import http.server
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1619,7 +1621,29 @@ def build_application() -> Application:
     return app
 
 
+def start_health_check_server() -> None:
+    """Run a minimal HTTP server in a background thread to satisfy Render's port check."""
+    port = int(os.environ.get("PORT", "10000"))
+
+    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format: str, *args: object) -> None:
+            # Suppress noisy health-check access logs
+            pass
+
+    server = http.server.HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Render Web Service health check listening on port %d", port)
+
+
 def main() -> None:
+    start_health_check_server()
     app = build_application()
     modes = ", ".join(
         f"{config.SPAM_MODE_LABELS[name]}={delay:g}s"
