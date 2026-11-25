@@ -61,6 +61,7 @@ USER_COMMANDS = (
     BotCommand("basic", "🐢 Use Basic Spam mode"),
     BotCommand("medium", "⚖️ Use Medium Spam mode"),
     BotCommand("aggressive", "🔥 Use Aggressive mode"),
+    BotCommand("inf", "♾️ Infinite repeat until /stop"),
     BotCommand("stop", "🛑 Stop an active repeat"),
     BotCommand("activate", "🔐 Activate a license"),
     BotCommand("license", "📋 View license status"),
@@ -85,6 +86,7 @@ class RepeatTask:
     mode: str = config.DEFAULT_MODE
     sent: int = 0
     cancelled: bool = False
+    infinite: bool = False
     task: asyncio.Task | None = field(default=None, repr=False)
 
 
@@ -97,12 +99,13 @@ class TaskRegistry:
         self._lock = asyncio.Lock()
 
     async def start(
-        self, user_id: int, total: int, mode: str = config.DEFAULT_MODE
+        self, user_id: int, total: int, mode: str = config.DEFAULT_MODE,
+        infinite: bool = False,
     ) -> RepeatTask | None:
         async with self._lock:
             if user_id in self._tasks:
                 return None
-            job = RepeatTask(user_id=user_id, total=total, mode=mode)
+            job = RepeatTask(user_id=user_id, total=total, mode=mode, infinite=infinite)
             self._tasks[user_id] = job
             return job
 
@@ -396,6 +399,7 @@ async def cmd_help(
         "🐢 Basic Spam: <code>basic</code> (2s per message)\n"
         "⚖️ Medium Spam: <code>medium</code> (1s per message)\n"
         "🔥 Aggressive Domination: <code>aggressive</code> (0.5s per message)\n"
+        "♾️ <code>/inf &lt;message&gt;</code> — infinite repeat (1s delay)\n"
         "🎯 Reply to a message + <code>/repeat</code>\n"
         "🛑 <code>/stop</code>\n"
         "🔐 <code>/activate &lt;key&gt;</code>\n"
@@ -1103,6 +1107,163 @@ async def cmd_aggressive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await cmd_repeat(update, context, forced_mode="aggressive")
 
 
+# --------------------------------------------------------------------------- #
+# Infinite repeat (/inf)
+# --------------------------------------------------------------------------- #
+INF_DELAY = 1.0  # seconds between sends in infinite mode
+
+
+def parse_inf_args(args: list[str]) -> tuple[str] | str:
+    """Return (message,) or an error code string."""
+    if not args:
+        return "missing_message"
+    message = " ".join(args).strip()
+    if not message:
+        return "missing_message"
+    return (message,)
+
+
+async def _run_inf(
+    job: RepeatTask,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_to: int | None,
+    message_thread_id: int | None = None,
+) -> None:
+    stopped_reason: str | None = None
+    try:
+        while not job.cancelled:
+            try:
+                send_kwargs = {
+                    "chat_id": chat_id,
+                    "text": text,
+                }
+                if message_thread_id is not None:
+                    send_kwargs["message_thread_id"] = message_thread_id
+                if reply_to is not None:
+                    send_kwargs["reply_parameters"] = ReplyParameters(
+                        message_id=reply_to,
+                        allow_sending_without_reply=False,
+                    )
+                else:
+                    send_kwargs["allow_sending_without_reply"] = True
+                await context.bot.send_message(**send_kwargs)
+                job.sent += 1
+            except RetryAfter as exc:
+                wait_for = float(exc.retry_after) + 2
+                log.warning("Rate limited (inf), waiting %.1fs", wait_for)
+                await asyncio.sleep(wait_for)
+                continue
+            except Forbidden:
+                stopped_reason = "🚫 The bot is not allowed to send messages here."
+                break
+            except TelegramError as exc:
+                log.warning("Telegram error while repeating (inf): %s", exc)
+                stopped_reason = f"⚠️ Telegram error: {esc(str(exc))}"
+                break
+
+            await asyncio.sleep(INF_DELAY)
+    except asyncio.CancelledError:
+        job.cancelled = True
+        raise
+    finally:
+        await registry.finish(job.user_id)
+        try:
+            if job.cancelled:
+                summary = (
+                    "🛑 <b>Infinite Repeat Stopped</b>\n\n"
+                    f"📤 Messages sent: {job.sent}"
+                )
+            elif stopped_reason:
+                summary = (
+                    "🛑 <b>Infinite Repeat Stopped</b>\n\n"
+                    f"{stopped_reason}\n"
+                    f"📤 Messages sent: {job.sent}"
+                )
+            else:
+                summary = (
+                    "✅ <b>Infinite Repeat Ended</b>\n\n"
+                    f"📤 Messages sent: {job.sent}"
+                )
+            await context.bot.send_message(
+                chat_id=chat_id, text=summary, parse_mode=ParseMode.HTML
+            )
+        except TelegramError:
+            pass
+
+
+async def cmd_inf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = requester_id(update)
+    message = update.effective_message
+    if user_id is None or not message:
+        return
+
+    if not lm.has_active_license(user_id):
+        await reply(update, NO_LICENSE)
+        return
+
+    parsed = parse_inf_args(context.args or [])
+    if parsed == "missing_message":
+        await reply(
+            update,
+            "⚠️ <b>Message Missing</b>\n\nUsage:\n"
+            "<code>/inf Hello everyone 👋</code>",
+        )
+        return
+
+    (text,) = parsed  # type: ignore[misc]
+
+    if registry.get(user_id):
+        await reply(
+            update,
+            "⏳ <b>Task Already Running</b>\n\n"
+            "You already have an active repeat task.\n\n"
+            "Use <code>/stop</code> to cancel it first.",
+        )
+        return
+
+    cooldown = registry.cooldown_left(user_id)
+    if cooldown:
+        await reply(
+            update,
+            f"🧊 <b>Cooldown Active</b>\n\nPlease wait {cooldown} second(s) "
+            "before starting another repeat task.",
+        )
+        return
+
+    job = await registry.start(user_id, 0, config.DEFAULT_MODE, infinite=True)
+    if job is None:
+        await reply(
+            update,
+            "⏳ <b>Task Already Running</b>\n\nUse <code>/stop</code> to cancel it first.",
+        )
+        return
+
+    target = message.reply_to_message
+    reply_to = target.message_id if target else None
+    message_thread_id = getattr(message, "message_thread_id", None)
+
+    await reply(
+        update,
+        "♾️ <b>Infinite Repeat Started</b>\n\n"
+        f'📝 Message: "{preview(text)}"\n'
+        f"⏱️ Delay: {INF_DELAY:g} second(s)\n"
+        "🛑 Send <code>/stop</code> to end",
+    )
+
+    job.task = asyncio.create_task(
+        _run_inf(
+            job,
+            context,
+            message.chat_id,
+            text,
+            reply_to,
+            message_thread_id,
+        )
+    )
+
+
 def _utf16_slice(text: str, start: int, end: int | None = None) -> str:
     encoded = text.encode("utf-16-le")
     stop = None if end is None else end * 2
@@ -1397,6 +1558,7 @@ async def cmd_channel_post(
         "basic": cmd_basic,
         "medium": cmd_medium,
         "aggressive": cmd_aggressive,
+        "inf": cmd_inf,
         "stop": cmd_stop,
         "ping": cmd_ping,
         "id": cmd_id,
@@ -1610,6 +1772,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("basic", cmd_basic))
     app.add_handler(CommandHandler("medium", cmd_medium))
     app.add_handler(CommandHandler("aggressive", cmd_aggressive))
+    app.add_handler(CommandHandler("inf", cmd_inf))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("activate", cmd_activate))
     app.add_handler(CommandHandler("license", cmd_license))
