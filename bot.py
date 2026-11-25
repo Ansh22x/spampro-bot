@@ -1108,9 +1108,50 @@ async def cmd_aggressive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # --------------------------------------------------------------------------- #
-# Infinite repeat (/inf)
+# Infinite repeat (/inf) — pacing
 # --------------------------------------------------------------------------- #
-INF_DELAY = 1.0  # seconds between sends in infinite mode
+INF_PRIVATE_INTERVAL = 1.0        # 1 s  → up to 60 msg/min in private chats
+INF_GROUP_INTERVAL = 3.5          # 3.5 s → ~17 msg/min, under the 20/min cap
+INF_GLOBAL_SEMAPHORE = 25         # bot-wide concurrent-send cap (< 30/s limit)
+
+_send_gate = asyncio.Semaphore(INF_GLOBAL_SEMAPHORE)
+
+
+class ChatPacer:
+    """Per-chat send pacer that serialises sends behind a lock."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._lock = asyncio.Lock()
+        self._next_at: float = 0.0  # monotonic timestamp
+
+    async def wait(self) -> None:
+        """Sleep until the next allowed send slot for this chat."""
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            if self._next_at > now:
+                await asyncio.sleep(self._next_at - now)
+            self._next_at = max(self._next_at, asyncio.get_event_loop().time()) + self.interval
+
+    def push_back(self, seconds: float) -> None:
+        """Shift the next slot further into the future (e.g. after a 429)."""
+        loop = asyncio.get_event_loop()
+        self._next_at = max(self._next_at, loop.time()) + seconds
+
+
+_pacers: dict[int, ChatPacer] = {}
+
+
+def get_pacer(chat_id: int, chat_type: str) -> ChatPacer:
+    """Return (or create) the ChatPacer for a given chat."""
+    if chat_id not in _pacers:
+        if chat_type == "private":
+            interval = INF_PRIVATE_INTERVAL
+        else:
+            interval = INF_GROUP_INTERVAL
+        _pacers[chat_id] = ChatPacer(interval)
+    return _pacers[chat_id]
 
 
 def parse_inf_args(args: list[str]) -> tuple[str] | str:
@@ -1130,10 +1171,16 @@ async def _run_inf(
     text: str,
     reply_to: int | None,
     message_thread_id: int | None = None,
+    *,
+    chat_type: str = "private",
 ) -> None:
+    pacer = get_pacer(chat_id, chat_type)
     stopped_reason: str | None = None
     try:
         while not job.cancelled:
+            await pacer.wait()
+            if job.cancelled:
+                break
             try:
                 send_kwargs = {
                     "chat_id": chat_id,
@@ -1148,11 +1195,13 @@ async def _run_inf(
                     )
                 else:
                     send_kwargs["allow_sending_without_reply"] = True
-                await context.bot.send_message(**send_kwargs)
+                async with _send_gate:
+                    await context.bot.send_message(**send_kwargs)
                 job.sent += 1
             except RetryAfter as exc:
                 wait_for = float(exc.retry_after) + 2
                 log.warning("Rate limited (inf), waiting %.1fs", wait_for)
+                pacer.push_back(wait_for)
                 await asyncio.sleep(wait_for)
                 continue
             except Forbidden:
@@ -1162,8 +1211,6 @@ async def _run_inf(
                 log.warning("Telegram error while repeating (inf): %s", exc)
                 stopped_reason = f"⚠️ Telegram error: {esc(str(exc))}"
                 break
-
-            await asyncio.sleep(INF_DELAY)
     except asyncio.CancelledError:
         job.cancelled = True
         raise
@@ -1243,12 +1290,14 @@ async def cmd_inf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target = message.reply_to_message
     reply_to = target.message_id if target else None
     message_thread_id = getattr(message, "message_thread_id", None)
+    chat_type = update.effective_chat.type if update.effective_chat else "private"
+    interval = INF_PRIVATE_INTERVAL if chat_type == "private" else INF_GROUP_INTERVAL
 
     await reply(
         update,
         "♾️ <b>Infinite Repeat Started</b>\n\n"
         f'📝 Message: "{preview(text)}"\n'
-        f"⏱️ Delay: {INF_DELAY:g} second(s)\n"
+        f"⏱️ Delay: {interval:g} second(s)\n"
         "🛑 Send <code>/stop</code> to end",
     )
 
@@ -1260,6 +1309,7 @@ async def cmd_inf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text,
             reply_to,
             message_thread_id,
+            chat_type=chat_type,
         )
     )
 
