@@ -974,3 +974,114 @@ def test_cancel_all_on_shutdown():
         assert a.cancelled and b.cancelled
 
     asyncio.run(scenario())
+
+
+# ----------------------- role-based /stop permissions ---------------------- #
+def _make_stop_update(user_id: int, chat_id: int, chat_type: str, replies: list[str]):
+    async def reply_text(text, **kwargs):
+        replies.append(text)
+
+    message = SimpleNamespace(reply_text=reply_text, sender_chat=None)
+    user = SimpleNamespace(id=user_id)
+    chat = SimpleNamespace(id=chat_id, type=chat_type)
+    return SimpleNamespace(
+        effective_user=user,
+        effective_chat=chat,
+        effective_message=message,
+        channel_post=None,
+    )
+
+
+def _make_stop_context(member_status: str = "member", args: list[str] | None = None):
+    async def get_chat_member(chat_id, user_id):
+        return SimpleNamespace(status=member_status)
+
+    return SimpleNamespace(
+        bot=SimpleNamespace(get_chat_member=get_chat_member),
+        args=args or [],
+    )
+
+
+def test_bot_admin_can_stop_any_action(monkeypatch):
+    import bot
+
+    async def scenario():
+        reg = bot.TaskRegistry()
+        monkeypatch.setattr(bot, "registry", reg)
+
+        j1 = await reg.start(5001, 10, chat_id=-1001)
+        j2 = await reg.start(5002, 10, chat_id=-1002)
+        replies: list[str] = []
+
+        # Bot admin (111) stops a specific user's task
+        upd = _make_stop_update(111, 111, "private", replies)
+        ctx = _make_stop_context(args=["5001"])
+        await bot.cmd_stop(upd, ctx)
+        assert j1.cancelled is True
+        assert j2.cancelled is False
+
+        # Bot admin (111) stops all remaining active tasks
+        upd2 = _make_stop_update(111, 111, "private", replies)
+        ctx2 = _make_stop_context(args=[])
+        await bot.cmd_stop(upd2, ctx2)
+        assert j2.cancelled is True
+
+    asyncio.run(scenario())
+
+
+def test_group_admin_can_stop_group_actions_only_and_cannot_use_bot_admin_cmds(monkeypatch):
+    import bot
+
+    async def scenario():
+        reg = bot.TaskRegistry()
+        monkeypatch.setattr(bot, "registry", reg)
+
+        in_group = await reg.start(6001, 10, chat_id=-2001)
+        other_group = await reg.start(6002, 10, chat_id=-2002)
+        replies: list[str] = []
+
+        # Group admin (777, not in ADMIN_IDS) stops tasks in -2001
+        upd = _make_stop_update(777, -2001, "supergroup", replies)
+        ctx = _make_stop_context(member_status="administrator")
+        await bot.cmd_stop(upd, ctx)
+        assert in_group.cancelled is True
+        assert other_group.cancelled is False
+
+        # Group admin cannot use bot admin commands
+        admin_replies: list[str] = []
+        upd_admin = _make_stop_update(777, -2001, "supergroup", admin_replies)
+        await bot.cmd_genkey(upd_admin, ctx)
+        await bot.cmd_keys(upd_admin, ctx)
+        assert len(admin_replies) == 2
+        assert all(msg == bot.NOT_ADMIN for msg in admin_replies)
+
+    asyncio.run(scenario())
+
+
+def test_key_user_can_stop_own_action_only_and_cannot_use_bot_admin_cmds(monkeypatch):
+    import bot
+
+    async def scenario():
+        reg = bot.TaskRegistry()
+        monkeypatch.setattr(bot, "registry", reg)
+
+        own_job = await reg.start(8001, 10, chat_id=-3001)
+        other_job = await reg.start(8002, 10, chat_id=-3001)
+        replies: list[str] = []
+
+        # Regular key user (8001, member) stops only their own task
+        upd = _make_stop_update(8001, -3001, "supergroup", replies)
+        ctx = _make_stop_context(member_status="member")
+        await bot.cmd_stop(upd, ctx)
+        assert own_job.cancelled is True
+        assert other_job.cancelled is False
+
+        # Key user cannot use bot admin commands
+        admin_replies: list[str] = []
+        upd_admin = _make_stop_update(8001, -3001, "supergroup", admin_replies)
+        await bot.cmd_genkey(upd_admin, ctx)
+        await bot.cmd_revoke(upd_admin, ctx)
+        assert len(admin_replies) == 2
+        assert all(msg == bot.NOT_ADMIN for msg in admin_replies)
+
+    asyncio.run(scenario())

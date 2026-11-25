@@ -87,6 +87,7 @@ class RepeatTask:
     sent: int = 0
     cancelled: bool = False
     infinite: bool = False
+    chat_id: int | None = None
     task: asyncio.Task | None = field(default=None, repr=False)
 
 
@@ -99,13 +100,23 @@ class TaskRegistry:
         self._lock = asyncio.Lock()
 
     async def start(
-        self, user_id: int, total: int, mode: str = config.DEFAULT_MODE,
+        self,
+        user_id: int,
+        total: int,
+        mode: str = config.DEFAULT_MODE,
         infinite: bool = False,
+        chat_id: int | None = None,
     ) -> RepeatTask | None:
         async with self._lock:
             if user_id in self._tasks:
                 return None
-            job = RepeatTask(user_id=user_id, total=total, mode=mode, infinite=infinite)
+            job = RepeatTask(
+                user_id=user_id,
+                total=total,
+                mode=mode,
+                infinite=infinite,
+                chat_id=chat_id,
+            )
             self._tasks[user_id] = job
             return job
 
@@ -133,9 +144,22 @@ class TaskRegistry:
             job.task.cancel()
         return job
 
-    async def cancel_all(self) -> None:
+    async def cancel_in_chat(self, chat_id: int) -> list[RepeatTask]:
+        cancelled: list[RepeatTask] = []
+        for user_id, job in list(self._tasks.items()):
+            if job.chat_id == chat_id:
+                res = await self.cancel(user_id)
+                if res is not None:
+                    cancelled.append(res)
+        return cancelled
+
+    async def cancel_all(self) -> list[RepeatTask]:
+        cancelled: list[RepeatTask] = []
         for user_id in list(self._tasks):
-            await self.cancel(user_id)
+            res = await self.cancel(user_id)
+            if res is not None:
+                cancelled.append(res)
+        return cancelled
 
 
 registry = TaskRegistry()
@@ -161,6 +185,26 @@ async def reply(update: Update, text: str) -> None:
 def admin_only(update: Update) -> bool:
     user = update.effective_user
     return bool(user and config.is_admin(user.id))
+
+
+async def is_group_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Return True if the sender is an administrator or owner of the current group."""
+    chat = update.effective_chat
+    if not chat or chat.type not in {"group", "supergroup"}:
+        return False
+    message = update.effective_message
+    if message and message.sender_chat and message.sender_chat.id == chat.id:
+        return True
+    user = update.effective_user
+    if not user:
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except TelegramError:
+        return False
+    return getattr(member, "status", None) in {"administrator", "creator"}
 
 
 def requester_id(update: Update) -> int | None:
@@ -1050,7 +1094,7 @@ async def cmd_repeat(
         )
         return
 
-    job = await registry.start(user_id, count, mode)
+    job = await registry.start(user_id, count, mode, chat_id=message.chat_id)
     if job is None:
         await reply(
             update,
@@ -1279,7 +1323,9 @@ async def cmd_inf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    job = await registry.start(user_id, 0, config.DEFAULT_MODE, infinite=True)
+    job = await registry.start(
+        user_id, 0, config.DEFAULT_MODE, infinite=True, chat_id=message.chat_id
+    )
     if job is None:
         await reply(
             update,
@@ -1506,7 +1552,7 @@ async def _run_folder_in_group(
         return
 
     mode = config.DEFAULT_MODE
-    job = await registry.start(user_id, count, mode)
+    job = await registry.start(user_id, count, mode, chat_id=message.chat_id)
     if job is None:
         await reply(update, "⏳ <b>Task Already Running</b>")
         return
@@ -1622,8 +1668,72 @@ async def cmd_channel_post(
     await handler(update, context)
 
 
-async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = requester_id(update)
+    chat = update.effective_chat
+    is_bot_admin = admin_only(update) or (
+        user_id is not None and config.is_admin(user_id)
+    )
+
+    if is_bot_admin:
+        args = context.args or []
+        if args:
+            target = args[0].strip()
+            if target.lower() == "all":
+                cancelled = await registry.cancel_all()
+            elif target.lstrip("-").isdigit():
+                job = await registry.cancel(int(target))
+                cancelled = [job] if job is not None else []
+            else:
+                await reply(
+                    update,
+                    "⚠️ <b>Invalid Target</b>\n\nUsage:\n"
+                    "<code>/stop</code> — stop tasks in this chat (or all)\n"
+                    "<code>/stop all</code> — stop all active tasks\n"
+                    "<code>/stop &lt;user_id&gt;</code> — stop a specific user's task",
+                )
+                return
+        elif chat and chat.type in {"group", "supergroup", "channel"}:
+            cancelled = await registry.cancel_in_chat(chat.id)
+            if not cancelled:
+                cancelled = await registry.cancel_all()
+        else:
+            cancelled = await registry.cancel_all()
+
+        if not cancelled:
+            await reply(
+                update,
+                "ℹ️ <b>No Active Task</b>\n\nThere are no running repeat tasks.",
+            )
+            return
+        count = len(cancelled)
+        noun = "task" if count == 1 else "tasks"
+        await reply(
+            update,
+            f"🛑 <b>Repeat Stopped</b>\n\nCancelled {count} active {noun}.",
+        )
+        return
+
+    if chat and chat.type in {"group", "supergroup"} and await is_group_admin(
+        update, context
+    ):
+        cancelled = await registry.cancel_in_chat(chat.id)
+        if not cancelled:
+            await reply(
+                update,
+                "ℹ️ <b>No Active Task</b>\n\n"
+                "There are no running repeat tasks in this group.",
+            )
+            return
+        count = len(cancelled)
+        noun = "task" if count == 1 else "tasks"
+        await reply(
+            update,
+            f"🛑 <b>Repeat Stopped</b>\n\n"
+            f"Group admin cancelled {count} active {noun} in this group.",
+        )
+        return
+
     if user_id is None:
         return
     job = await registry.cancel(user_id)
