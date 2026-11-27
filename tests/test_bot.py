@@ -1058,7 +1058,7 @@ def test_group_admin_can_stop_group_actions_only_and_cannot_use_bot_admin_cmds(m
     asyncio.run(scenario())
 
 
-def test_key_user_can_stop_own_action_only_and_cannot_use_bot_admin_cmds(monkeypatch):
+def test_key_user_cannot_stop_any_action_and_cannot_use_bot_admin_cmds(monkeypatch):
     import bot
 
     async def scenario():
@@ -1069,12 +1069,14 @@ def test_key_user_can_stop_own_action_only_and_cannot_use_bot_admin_cmds(monkeyp
         other_job = await reg.start(8002, 10, chat_id=-3001)
         replies: list[str] = []
 
-        # Regular key user (8001, member) stops only their own task
+        # Regular key user (8001, member) is denied — cannot stop anything
         upd = _make_stop_update(8001, -3001, "supergroup", replies)
         ctx = _make_stop_context(member_status="member")
         await bot.cmd_stop(upd, ctx)
-        assert own_job.cancelled is True
+        assert own_job.cancelled is False
         assert other_job.cancelled is False
+        assert len(replies) == 1
+        assert "Not Authorized" in replies[0]
 
         # Key user cannot use bot admin commands
         admin_replies: list[str] = []

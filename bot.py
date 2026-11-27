@@ -1734,19 +1734,11 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    if user_id is None:
-        return
-    job = await registry.cancel(user_id)
-    if job is None:
-        await reply(
-            update,
-            "ℹ️ <b>No Active Task</b>\n\nYou don't have any running repeat task.",
-        )
-        return
+    # Regular users cannot stop any actions — only admins can.
     await reply(
         update,
-        "🛑 <b>Repeat Stopped</b>\n\n"
-        "Your active repeat task has been cancelled successfully.",
+        "🚫 <b>Not Authorized</b>\n\n"
+        "Only bot admins and group admins can stop active tasks.",
     )
 
 
