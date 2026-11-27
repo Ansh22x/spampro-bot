@@ -1087,3 +1087,47 @@ def test_key_user_cannot_stop_any_action_and_cannot_use_bot_admin_cmds(monkeypat
         assert all(msg == bot.NOT_ADMIN for msg in admin_replies)
 
     asyncio.run(scenario())
+
+
+# --------------------------------- rooms ---------------------------------- #
+def test_only_bot_admin_can_create_and_manage_rooms():
+    import bot
+    import database as db
+
+    async def scenario():
+        # Non-admin (500) cannot create, close, or list rooms
+        non_admin_replies: list[str] = []
+        upd_user = _make_stop_update(500, 500, "private", non_admin_replies)
+        ctx = _make_stop_context(args=["VIP Room"])
+        await bot.cmd_createroom(upd_user, ctx)
+        await bot.cmd_closeroom(upd_user, ctx)
+        await bot.cmd_rooms(upd_user, ctx)
+        assert len(non_admin_replies) == 3
+        assert all(msg == bot.NOT_ADMIN for msg in non_admin_replies)
+        assert db.list_rooms() == []
+
+        # Bot admin (111) creates a room
+        admin_replies: list[str] = []
+        upd_admin = _make_stop_update(111, 111, "private", admin_replies)
+        await bot.cmd_createroom(upd_admin, _make_stop_context(args=["Alpha", "Room"]))
+        rooms = db.list_rooms()
+        assert len(rooms) == 1
+        room_id = str(rooms[0]["room_id"])
+        assert rooms[0]["name"] == "Alpha Room"
+        assert room_id in admin_replies[0]
+
+        # Regular user joins, checks, and leaves the room
+        user_replies: list[str] = []
+        upd_join = _make_stop_update(500, 500, "private", user_replies)
+        await bot.cmd_joinroom(upd_join, _make_stop_context(args=[room_id]))
+        assert db.room_member_count(room_id) == 1
+        await bot.cmd_room(upd_join, _make_stop_context())
+        assert "Alpha Room" in user_replies[1]
+        await bot.cmd_leaveroom(upd_join, _make_stop_context())
+        assert db.room_member_count(room_id) == 0
+
+        # Bot admin closes the room
+        await bot.cmd_closeroom(upd_admin, _make_stop_context(args=[room_id]))
+        assert db.list_rooms() == []
+
+    asyncio.run(scenario())

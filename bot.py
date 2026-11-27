@@ -8,6 +8,7 @@ import http.server
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -65,6 +66,9 @@ USER_COMMANDS = (
     BotCommand("stop", "🛑 Stop an active repeat"),
     BotCommand("activate", "🔐 Activate a license"),
     BotCommand("license", "📋 View license status"),
+    BotCommand("joinroom", "🚪 Join a room"),
+    BotCommand("leaveroom", "🚶 Leave current room"),
+    BotCommand("room", "🏠 View current room"),
     BotCommand("about", "🤖 About SpamPro v.01"),
     BotCommand("health", "❤️ Check live bot health"),
 )
@@ -73,6 +77,9 @@ ADMIN_COMMANDS = USER_COMMANDS + (
     BotCommand("keys", "📊 View license statistics"),
     BotCommand("revoke", "🚫 Revoke a license key"),
     BotCommand("scankey", "🔍 Check license key information"),
+    BotCommand("createroom", "🏗️ Create a new room"),
+    BotCommand("closeroom", "🗑️ Close a room"),
+    BotCommand("rooms", "🏘️ List all rooms"),
 )
 
 
@@ -448,6 +455,9 @@ async def cmd_help(
         "🛑 <code>/stop</code>\n"
         "🔐 <code>/activate &lt;key&gt;</code>\n"
         "📋 <code>/license</code>\n"
+        "🚪 <code>/joinroom &lt;room_id&gt;</code>\n"
+        "🚶 <code>/leaveroom</code>\n"
+        "🏠 <code>/room</code>\n"
         "🤖 <code>/about</code>\n"
         "❤️ <code>/health</code>\n"
         "🔍 <code>/scankey &lt;key&gt;</code> — admin only"
@@ -459,6 +469,9 @@ async def cmd_help(
             "🔑 <code>/genkey</code>\n"
             "📊 <code>/keys</code>\n"
             "🚫 <code>/revoke &lt;key&gt;</code>\n"
+            "🏗️ <code>/createroom [name]</code>\n"
+            "🗑️ <code>/closeroom &lt;room_id&gt;</code>\n"
+            "🏘️ <code>/rooms</code>\n"
             "\n📂 <b>Folder Examples</b>\n"
             "💾 Save/update in bot DM: "
             "<code>/folder1 Welcome to our group!</code>\n"
@@ -1742,6 +1755,161 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Room system
+# --------------------------------------------------------------------------- #
+MAX_ROOM_NAME_LENGTH = 64
+
+
+def _generate_room_id() -> str:
+    for _ in range(10):
+        candidate = f"ROOM-{secrets.token_hex(2).upper()}"
+        if db.get_room(candidate) is None:
+            return candidate
+    return f"ROOM-{secrets.token_hex(3).upper()}"
+
+
+async def cmd_createroom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not admin_only(update):
+        await reply(update, NOT_ADMIN)
+        return
+    user = update.effective_user
+    if not user:
+        return
+    raw_name = " ".join(context.args or []).strip()
+    if len(raw_name) > MAX_ROOM_NAME_LENGTH:
+        await reply(
+            update,
+            f"⚠️ <b>Room Name Too Long</b>\n\nMaximum length is {MAX_ROOM_NAME_LENGTH} characters.",
+        )
+        return
+
+    room_id = _generate_room_id()
+    name = raw_name or room_id
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    db.create_room(
+        room_id,
+        name,
+        user.id,
+        chat_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
+    log.info("Admin %s created room %s (%s)", user.id, room_id, name)
+    await reply(
+        update,
+        "🏗️ <b>Room Created</b>\n\n"
+        f"🆔 Room ID: <code>{esc(room_id)}</code>\n"
+        f"🏷️ Name: <b>{esc(name)}</b>\n\n"
+        f"Users can join with:\n<code>/joinroom {esc(room_id)}</code>",
+    )
+
+
+async def cmd_closeroom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not admin_only(update):
+        await reply(update, NOT_ADMIN)
+        return
+    if not context.args:
+        await reply(
+            update,
+            "⚠️ <b>Room ID Missing</b>\n\nUsage:\n<code>/closeroom ROOM-1A2B</code>",
+        )
+        return
+    room_id = context.args[0].strip().upper()
+    if not db.close_room(room_id):
+        await reply(
+            update,
+            "❌ <b>Room Not Found</b>\n\nNo active room matches that ID.",
+        )
+        return
+    await reply(
+        update,
+        f"🗑️ <b>Room Closed</b>\n\nRoom <code>{esc(room_id)}</code> has been closed.",
+    )
+
+
+async def cmd_rooms(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not admin_only(update):
+        await reply(update, NOT_ADMIN)
+        return
+    rooms = db.list_rooms()
+    if not rooms:
+        await reply(update, "🏘️ <b>Active Rooms</b>\n\nNo rooms have been created yet.")
+        return
+    lines = ["🏘️ <b>Active Rooms</b>\n"]
+    for row in rooms:
+        lines.append(
+            f"• <code>{esc(str(row['room_id']))}</code> — "
+            f"<b>{esc(str(row['name']))}</b> ({int(row['member_count'])} member(s))"
+        )
+    await reply(update, "\n".join(lines))
+
+
+async def cmd_joinroom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    if not context.args:
+        await reply(
+            update,
+            "⚠️ <b>Room ID Missing</b>\n\nUsage:\n<code>/joinroom ROOM-1A2B</code>",
+        )
+        return
+    room_id = context.args[0].strip().upper()
+    if not db.join_room(room_id, user.id, datetime.now(timezone.utc).isoformat()):
+        await reply(
+            update,
+            "❌ <b>Room Not Found</b>\n\nThe specified room does not exist or has been closed.",
+        )
+        return
+    room = db.get_room(room_id)
+    room_name = str(room["name"]) if room else room_id
+    members = db.room_member_count(room_id)
+    await reply(
+        update,
+        "🚪 <b>Joined Room</b>\n\n"
+        f"🆔 Room ID: <code>{esc(room_id)}</code>\n"
+        f"🏷️ Name: <b>{esc(room_name)}</b>\n"
+        f"👥 Members: {members}",
+    )
+
+
+async def cmd_leaveroom(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    left = db.leave_room(user.id)
+    if left is None:
+        await reply(update, "ℹ️ <b>Not In a Room</b>\n\nYou are not currently in any room.")
+        return
+    await reply(
+        update,
+        f"🚶 <b>Left Room</b>\n\nYou have left room <code>{esc(left)}</code>.",
+    )
+
+
+async def cmd_room(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    room = db.get_user_room(user.id)
+    if room is None:
+        await reply(
+            update,
+            "ℹ️ <b>Not In a Room</b>\n\nUse <code>/joinroom &lt;room_id&gt;</code> to join one.",
+        )
+        return
+    room_id = str(room["room_id"])
+    members = db.room_member_count(room_id)
+    await reply(
+        update,
+        "🏠 <b>Current Room</b>\n\n"
+        f"🆔 Room ID: <code>{esc(room_id)}</code>\n"
+        f"🏷️ Name: <b>{esc(str(room['name']))}</b>\n"
+        f"👥 Members: {members}",
+    )
+
+
 def _expiry_notification_text(lic: lm.License, milestone: str, days: int) -> str:
     if milestone == lm.NOTIFY_EXPIRED:
         return (
@@ -1932,6 +2100,12 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("keys", cmd_keys))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("scankey", cmd_scankey))
+    app.add_handler(CommandHandler("createroom", cmd_createroom))
+    app.add_handler(CommandHandler("closeroom", cmd_closeroom))
+    app.add_handler(CommandHandler("rooms", cmd_rooms))
+    app.add_handler(CommandHandler("joinroom", cmd_joinroom))
+    app.add_handler(CommandHandler("leaveroom", cmd_leaveroom))
+    app.add_handler(CommandHandler("room", cmd_room))
     app.add_error_handler(on_error)
     return app
 
