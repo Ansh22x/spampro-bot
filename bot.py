@@ -1727,31 +1727,11 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    if chat and chat.type in {"group", "supergroup"} and await is_group_admin(
-        update, context
-    ):
-        cancelled = await registry.cancel_in_chat(chat.id)
-        if not cancelled:
-            await reply(
-                update,
-                "ℹ️ <b>No Active Task</b>\n\n"
-                "There are no running repeat tasks in this group.",
-            )
-            return
-        count = len(cancelled)
-        noun = "task" if count == 1 else "tasks"
-        await reply(
-            update,
-            f"🛑 <b>Repeat Stopped</b>\n\n"
-            f"Group admin cancelled {count} active {noun} in this group.",
-        )
-        return
-
-    # Regular users cannot stop any actions — only admins can.
+    # Regular users and group admins cannot stop actions — only bot admins can.
     await reply(
         update,
         "🚫 <b>Not Authorized</b>\n\n"
-        "Only bot admins and group admins can stop active tasks.",
+        "Only bot admins can stop active tasks.",
     )
 
 

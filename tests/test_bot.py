@@ -1029,7 +1029,7 @@ def test_bot_admin_can_stop_any_action(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_group_admin_can_stop_group_actions_only_and_cannot_use_bot_admin_cmds(monkeypatch):
+def test_group_admin_cannot_stop_actions_and_cannot_use_bot_admin_cmds(monkeypatch):
     import bot
 
     async def scenario():
@@ -1040,12 +1040,14 @@ def test_group_admin_can_stop_group_actions_only_and_cannot_use_bot_admin_cmds(m
         other_group = await reg.start(6002, 10, chat_id=-2002)
         replies: list[str] = []
 
-        # Group admin (777, not in ADMIN_IDS) stops tasks in -2001
+        # Group admin (777, not in ADMIN_IDS) is denied from stopping tasks
         upd = _make_stop_update(777, -2001, "supergroup", replies)
         ctx = _make_stop_context(member_status="administrator")
         await bot.cmd_stop(upd, ctx)
-        assert in_group.cancelled is True
+        assert in_group.cancelled is False
         assert other_group.cancelled is False
+        assert len(replies) == 1
+        assert "Not Authorized" in replies[0]
 
         # Group admin cannot use bot admin commands
         admin_replies: list[str] = []
